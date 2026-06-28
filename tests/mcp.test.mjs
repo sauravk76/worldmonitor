@@ -37,6 +37,10 @@ function initBody(id = 1) {
   };
 }
 
+function assertNoStore(res, label) {
+  assert.equal(res.headers.get('Cache-Control'), 'no-store', `${label} must include Cache-Control: no-store`);
+}
+
 let handler;
 let evaluateFreshness;
 
@@ -152,6 +156,63 @@ describe('api/mcp.ts — PRO MCP Server', () => {
     const res = await handler(req);
     const body = await res.json();
     assert.equal(body.error?.code, -32600);
+  });
+
+  it('sets Cache-Control: no-store on representative MCP success and error responses', async () => {
+    const preflight = await handler(new Request(BASE_URL, {
+      method: 'OPTIONS',
+      headers: { origin: 'https://claude.ai' },
+    }));
+    assert.equal(preflight.status, 204);
+    assertNoStore(preflight, 'OPTIONS preflight');
+
+    const unauthenticated = await handler(new Request(BASE_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(initBody()),
+    }));
+    assert.equal(unauthenticated.status, 401);
+    assertNoStore(unauthenticated, 'auth error');
+
+    const initialized = await handler(makeReq('POST', initBody(20)));
+    assert.equal(initialized.status, 200);
+    assertNoStore(initialized, 'initialize success');
+    assert.ok(initialized.headers.get('Mcp-Session-Id'), 'Mcp-Session-Id header must still be present');
+
+    const acknowledged = await handler(makeReq('POST', {
+      jsonrpc: '2.0',
+      method: 'notifications/initialized',
+      params: {},
+    }));
+    assert.equal(acknowledged.status, 202);
+    assertNoStore(acknowledged, 'notification acknowledgement');
+
+    const invalidMethod = await handler(makeReq('POST', {
+      jsonrpc: '2.0',
+      id: 21,
+      method: 'nonexistent/method',
+      params: {},
+    }));
+    assert.equal(invalidMethod.status, 200);
+    assertNoStore(invalidMethod, 'JSON-RPC error');
+  });
+
+  it('SSE-upgraded success carries no-store, no-transform and preserves the session id', async () => {
+    // Accept: text/event-stream makes maybeStreamJsonRpcResponse upgrade the 200
+    // initialize reply to an SSE stream. The streamed reply (which carries the
+    // tool/resource result data on tools/call) must keep no-transform for framing
+    // AND now carry no-store so the payload is not cached, and still expose the
+    // Mcp-Session-Id through the SSE envelope.
+    const res = await handler(makeReq('POST', initBody(40), { Accept: 'text/event-stream' }));
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('Content-Type') ?? '', /text\/event-stream/, 'must upgrade to an SSE stream');
+    assert.equal(
+      res.headers.get('Cache-Control'),
+      'no-store, no-transform',
+      'SSE success must be no-store (payload not cached) + no-transform (SSE framing preserved)',
+    );
+    assert.ok(res.headers.get('mcp-session-id'), 'Mcp-Session-Id must survive the SSE envelope');
+    await res.body?.cancel();
   });
 
   // --- logging/setLevel ---

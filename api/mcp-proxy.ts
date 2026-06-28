@@ -76,6 +76,10 @@ const SSE_CONNECT_TIMEOUT_MS = 10_000;
 const SSE_RPC_TIMEOUT_MS = process.env.NODE_TEST_CONTEXT ? 200 : 12_000;
 const MCP_PROTOCOL_VERSION = '2025-03-26';
 
+function withProxyNoStore(headers: Record<string, string> = {}): Record<string, string> {
+  return { ...headers, 'Cache-Control': 'no-store' };
+}
+
 const BLOCKED_HOST_PATTERNS = [
   /^localhost$/i,
   /^127\./,
@@ -447,14 +451,14 @@ async function handleCallTool(req: Request, cors: Record<string, string>, meta: 
   const result = isSseTransport(serverUrl)
     ? await mcpCallToolSse(serverUrl, toolName, toolArgs || {}, customHeaders || {})
     : await mcpCallTool(serverUrl, toolName, toolArgs || {}, customHeaders || {});
-  return jsonResponse({ result }, 200, { ...cors, 'Cache-Control': 'no-store' });
+  return jsonResponse({ result }, 200, cors);
 }
 
 export default async function handler(req) {
   if (isDisallowedOrigin(req))
-    return new Response('Forbidden', { status: 403 });
+    return new Response('Forbidden', { status: 403, headers: withProxyNoStore() });
 
-  const cors = getCorsHeaders(req, 'GET, POST, OPTIONS');
+  const cors = withProxyNoStore(getCorsHeaders(req, 'GET, POST, OPTIONS'));
   if (req.method === 'OPTIONS')
     return new Response(null, { status: 204, headers: cors });
 
@@ -515,14 +519,14 @@ export default async function handler(req) {
       }),
       {
         status: 429,
-        headers: {
+        headers: withProxyNoStore({
           'Content-Type': 'application/json',
           'X-RateLimit-Limit': String(scoped.limit),
           'X-RateLimit-Remaining': '0',
           'X-RateLimit-Reset': String(scoped.reset),
           'Retry-After': String(retryAfter),
           ...cors,
-        },
+        }),
       },
     );
   }

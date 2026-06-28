@@ -17,7 +17,7 @@ import { dispatchToolsCall } from './dispatch';
 import { buildPromptResponse, PROMPT_LIST_RESPONSE } from './prompts/index';
 import { TOOL_LIST_BYTES, TOOL_LIST_RESPONSE } from './registry/index';
 import { buildResourceResponse, RESOURCE_LIST_RESPONSE } from './resources/index';
-import { rpcError, rpcOk } from './rpc';
+import { rpcError, rpcOk, withMcpNoStore } from './rpc';
 import { emitTelemetry, principalIdForLog } from './telemetry';
 import type { McpHandlerDeps } from './types';
 
@@ -133,6 +133,9 @@ function replayEventsAfter(sessionId: string, lastEventId: string): StoredSseEve
 function sseHeadersFrom(headers: Headers): Headers {
   const out = new Headers(headers);
   out.set('Content-Type', SSE_CONTENT_TYPE);
+  // no-store forbids storing the (sensitive Pro tool-result) payload, matching the
+  // no-store the JSON branches carry; no-transform stays load-bearing for SSE (it
+  // blocks proxy gzip/buffering that would corrupt the event-stream framing).
   out.set('Cache-Control', MCP_CACHE_CONTROL);
   return out;
 }
@@ -163,13 +166,13 @@ function handleSseReplay(req: Request, corsHeaders: Record<string, string>): Res
   if (!clientAcceptsSse(req)) {
     return new Response(
       JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'SSE replay requires Accept: text/event-stream' } }),
-      { status: 406, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+      { status: 406, headers: withMcpNoStore({ 'Content-Type': 'application/json', ...corsHeaders }) },
     );
   }
   if (!lastEventId) {
     return new Response(
       JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Missing Last-Event-ID for SSE replay' } }),
-      { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+      { status: 400, headers: withMcpNoStore({ 'Content-Type': 'application/json', ...corsHeaders }) },
     );
   }
 
@@ -177,7 +180,7 @@ function handleSseReplay(req: Request, corsHeaders: Record<string, string>): Res
   if (!sessionId) {
     return new Response(
       JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Missing Mcp-Session-Id for SSE replay' } }),
-      { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+      { status: 400, headers: withMcpNoStore({ 'Content-Type': 'application/json', ...corsHeaders }) },
     );
   }
 
@@ -192,12 +195,15 @@ function handleSseReplay(req: Request, corsHeaders: Record<string, string>): Res
           message: 'SSE replay cursor not found for this session; the stream may have expired or the reconnect may have reached a different server instance',
         },
       }),
-      { status: 404, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+      { status: 404, headers: withMcpNoStore({ 'Content-Type': 'application/json', ...corsHeaders }) },
     );
   }
 
   return new Response(createSseStream(events), {
     status: 200,
+    // corsHeaders is getMcpCorsHeaders() (MCP_CACHE_CONTROL = no-store, no-transform):
+    // the replay carries previously-streamed tool-result data, so no-store forbids
+    // caching it and no-transform preserves SSE framing.
     headers: { 'Content-Type': SSE_CONTENT_TYPE, ...corsHeaders },
   });
 }
@@ -214,20 +220,20 @@ export async function mcpHandler(
   const corsHeaders = getMcpCorsHeaders();
 
   if (req.method === 'OPTIONS') {
-    return new Response(null, { status: 204, headers: corsHeaders });
+    return new Response(null, { status: 204, headers: withMcpNoStore(corsHeaders) });
   }
   if (req.method === 'HEAD') {
-    return new Response(null, { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+    return new Response(null, { status: 200, headers: withMcpNoStore({ 'Content-Type': 'application/json', ...corsHeaders }) });
   }
 
   // Origin validation: allow claude.ai/claude.com web clients; allow absent origin (desktop/CLI)
   const origin = req.headers.get('Origin');
   if (origin && origin !== 'https://claude.ai' && origin !== 'https://claude.com') {
-    return new Response('Forbidden', { status: 403, headers: corsHeaders });
+    return new Response('Forbidden', { status: 403, headers: withMcpNoStore(corsHeaders) });
   }
 
   if (req.method !== 'POST' && req.method !== 'GET') {
-    return new Response(null, { status: 405, headers: { Allow: 'POST, GET, HEAD, OPTIONS', ...corsHeaders } });
+    return new Response(null, { status: 405, headers: withMcpNoStore({ Allow: 'POST, GET, HEAD, OPTIONS', ...corsHeaders }) });
   }
 
   // Host-derived resource_metadata pointer matches api/oauth-protected-resource.ts.
@@ -300,7 +306,7 @@ export async function mcpHandler(
       }, { 'Mcp-Session-Id': sessionId, ...corsHeaders }));
     }
     case 'notifications/initialized':
-      return new Response(null, { status: 202, headers: corsHeaders });
+      return new Response(null, { status: 202, headers: withMcpNoStore(corsHeaders) });
     case 'ping':
       return maybeStreamJsonRpcResponse(req, rpcOk(id, {}, corsHeaders));
     case 'tools/list':
