@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { runInNewContext } from 'node:vm';
 
 // #4580 item (a): the inline boot skeleton in index.html must reserve the same
 // above-the-fold footprint as the first hydrated dashboard frame, or the
@@ -23,6 +24,7 @@ const root = resolve(__dirname, '..');
 const html = readFileSync(join(root, 'index.html'), 'utf-8');
 const css = readFileSync(join(root, 'src', 'styles', 'main.css'), 'utf-8');
 const utils = readFileSync(join(root, 'src', 'utils', 'index.ts'), 'utf-8');
+const panelLayout = readFileSync(join(root, 'src', 'app', 'panel-layout.ts'), 'utf-8');
 
 /** Collapse whitespace and drop `!important` so declarations compare structurally. */
 const norm = (v) => v.replace(/!important/g, '').trim().replace(/\s+/g, ' ');
@@ -98,6 +100,47 @@ function mediaRuleAtBreakpoint(source, breakpoint, selectorRe, must) {
   return null;
 }
 
+function classMethodBody(source, signature) {
+  const start = source.indexOf(signature);
+  assert.notEqual(start, -1, `Expected ${signature} in panel-layout.ts`);
+  const openBrace = source.indexOf('{', start);
+  const closeBrace = matchingBraceIndex(source, openBrace);
+  assert.notEqual(closeBrace, -1, `Expected ${signature} to close`);
+  return source.slice(openBrace + 1, closeBrace);
+}
+
+function runPrepaintBootScript(mapCollapsed) {
+  const script = html.match(/<script data-wm-prepaint>([\s\S]*?)<\/script>/);
+  assert.ok(script, 'Expected the explicitly marked inline pre-paint boot script in index.html');
+
+  const classes = new Set();
+  const storage = new Map([['mobile-map-collapsed', String(mapCollapsed)]]);
+  const window = {};
+  window.self = window;
+  window.top = window;
+
+  runInNewContext(script[1], {
+    document: {
+      documentElement: {
+        dataset: {},
+        classList: {
+          add: (name) => classes.add(name),
+          remove: (name) => classes.delete(name),
+        },
+        removeAttribute: () => {},
+      },
+    },
+    localStorage: {
+      getItem: (key) => storage.get(key) ?? null,
+      removeItem: (key) => storage.delete(key),
+    },
+    location: { hostname: 'www.worldmonitor.app' },
+    window,
+  });
+
+  return classes;
+}
+
 describe('#4580 boot skeleton <-> app footprint parity', () => {
   it('mobile skeleton map reserves the same height as the real .map-section', () => {
     // Source of truth: the full-viewport mobile map rule in main.css.
@@ -124,6 +167,56 @@ describe('#4580 boot skeleton <-> app footprint parity', () => {
         `skeleton .skeleton-map "${prop}" must match real .map-section "${prop}" (#4580 mobile CLS parity)`,
       );
     }
+  });
+
+  it('collapsed mobile skeleton map mirrors the stored collapsed-map footprint', () => {
+    const realCollapsedMap = mediaRule(css, '\\.main-content \\.map-section\\.collapsed', 'height: auto');
+    assert.ok(
+      realCollapsedMap,
+      'Expected the mobile .map-section.collapsed rule to define the collapsed map footprint in main.css',
+    );
+
+    const collapsedSkeletonMap = mediaRule(html, 'html\\.wm-map-collapsed \\.skeleton-map', 'height:auto');
+    assert.ok(
+      collapsedSkeletonMap,
+      'index.html must override the mobile skeleton footprint when mobile-map-collapsed is stored before paint',
+    );
+    assert.equal(
+      collapsedSkeletonMap.breakpoint,
+      realCollapsedMap.breakpoint,
+      'collapsed skeleton and real map must use the same mobile breakpoint',
+    );
+
+    for (const prop of ['height', 'min-height', 'max-height']) {
+      assert.deepEqual(
+        declarations(collapsedSkeletonMap.body, prop),
+        declarations(realCollapsedMap.body, prop),
+        `collapsed skeleton .skeleton-map "${prop}" must match real .map-section.collapsed`,
+      );
+    }
+
+    const collapsedSkeletonBody = mediaRule(html, 'html\\.wm-map-collapsed \\.skeleton-map-body', 'display:none');
+    assert.ok(
+      collapsedSkeletonBody,
+      'collapsed skeleton must hide the loading card so it cannot contribute intrinsic height',
+    );
+    assert.deepEqual(declarations(collapsedSkeletonBody.body, 'display'), ['none']);
+
+    assert.ok(
+      runPrepaintBootScript(true).has('wm-map-collapsed'),
+      'the inline pre-paint script must stamp the matching html class for a persisted collapsed map',
+    );
+    assert.ok(
+      !runPrepaintBootScript(false).has('wm-map-collapsed'),
+      'the inline pre-paint script must leave the expanded-map cohort unchanged',
+    );
+
+    const mobileMapToggle = classMethodBody(panelLayout, 'private setupMobileMapToggle()');
+    assert.match(
+      mobileMapToggle,
+      /document\.documentElement\.classList\.remove\('wm-map-collapsed'\)/,
+      'hydration must clear the boot-only html class after the skeleton is replaced',
+    );
   });
 
   it('mobile skeleton header height matches the real .header height', () => {
